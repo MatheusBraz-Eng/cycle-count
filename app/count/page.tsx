@@ -22,23 +22,21 @@ function extractRowsFromSheet(json: Record<string, unknown>[]): HrmCageRow[] {
         Object.entries(row).map(([key, value]) => [normalizeHeader(key), value]),
       );
 
-      const pn =
-        String(
-          normalized.PN ??
-            normalized.PART_NUMBER ??
-            normalized.ITEM ??
-            normalized.SKU ??
-            "",
-        ).trim();
+      const pn = String(
+        normalized.PN ??
+          normalized.PART_NUMBER ??
+          normalized.ITEM ??
+          normalized.SKU ??
+          "",
+      ).trim();
 
-      const gaveta =
-        String(
-          normalized.GAVETA ??
-            normalized.LOCACAO ??
-            normalized.LOCATION ??
-            normalized.BIN ??
-            "",
-        ).trim();
+      const gaveta = String(
+        normalized.GAVETA ??
+          normalized.LOCACAO ??
+          normalized.LOCATION ??
+          normalized.BIN ??
+          "",
+      ).trim();
 
       const quantidade = Number(
         normalized.QUANTIDADE ??
@@ -78,9 +76,18 @@ export default function CountPage() {
   ]);
   const [compareResults, setCompareResults] = useState<HrmCageCompareResult[]>([]);
   const [processing, setProcessing] = useState(false);
+  const [saved, setSaved] = useState(false);
 
   const glRule = useMemo(() => isGlLocation(form.location), [form.location]);
   const hrmRule = useMemo(() => isHrmCage(form.location), [form.location]);
+  const segasRule = useMemo(
+    () => form.location.trim().toUpperCase().includes("SEGAS"),
+    [form.location],
+  );
+  const hasSaldoFlow = useMemo(
+    () => hrmRule || compareResults.length > 0,
+    [hrmRule, compareResults.length],
+  );
 
   function resetAll() {
     setForm({
@@ -95,6 +102,7 @@ export default function CountPage() {
     setSaldoDacFile(null);
     setManualRows([{ pn: "", gaveta: "", quantidade: 0 }]);
     setCompareResults([]);
+    setSaved(false);
   }
 
   async function handleCompareHrmCage() {
@@ -120,13 +128,18 @@ export default function CountPage() {
     }
   }
 
+  function handleSaveCount() {
+    setSaved(true);
+    alert("Contagem mockada registrada com sucesso.");
+  }
+
   return (
     <main className="p-8">
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-3xl font-bold">Contagem</h1>
           <p className="text-gray-600">
-            Regras visuais e funcionais da Fase 1 com dados mockados.
+            Registro da contagem com regras de operação e próximos passos.
           </p>
         </div>
 
@@ -156,7 +169,7 @@ export default function CountPage() {
                 className="rounded-xl border px-3 py-2"
                 value={form.location}
                 onChange={(e) => setForm((prev) => ({ ...prev, location: e.target.value }))}
-                placeholder="Ex.: GL-01 ou HRM CAGE"
+                placeholder="Ex.: GL-01, HRM CAGE ou SEGAS"
               />
             </label>
 
@@ -354,10 +367,46 @@ export default function CountPage() {
 
           <button
             className="mt-6 rounded-xl bg-slate-900 px-4 py-2 text-white"
-            onClick={() => alert("Contagem mockada registrada com sucesso.")}
+            onClick={handleSaveCount}
           >
-            Salvar contagem
+            Finalizar contagem
           </button>
+
+          {saved && (
+            <div className="mt-6 rounded-2xl border bg-slate-50 p-4">
+              <h2 className="text-xl font-semibold">Próximos passos</h2>
+              <p className="mt-2 text-sm text-gray-600">
+                A contagem foi registrada. Escolha a próxima ação conforme a regra operacional.
+              </p>
+
+              <div className="mt-4 flex flex-wrap gap-3">
+                {hasSaldoFlow && (
+                  <a
+                    href="/recount?as=operator"
+                    className="rounded-xl bg-amber-500 px-4 py-2 text-white"
+                  >
+                    Ir para recontagem
+                  </a>
+                )}
+
+                {segasRule && (
+                  <a
+                    href="/ic?as=ic"
+                    className="rounded-xl bg-red-600 px-4 py-2 text-white"
+                  >
+                    Solicitar recontagem para IC
+                  </a>
+                )}
+
+                <a
+                  href="/api/export"
+                  className="rounded-xl border px-4 py-2"
+                >
+                  Exportar contagem para Excel
+                </a>
+              </div>
+            </div>
+          )}
         </section>
 
         <aside className="rounded-2xl border p-6">
@@ -367,11 +416,13 @@ export default function CountPage() {
             <li>Locação HRM CAGE habilita upload do arquivo principal e do Saldo DAC.</li>
             <li>Também libera cadastro manual de gavetas e quantidades.</li>
             <li>O confronto considera PN + gaveta + quantidade.</li>
-            <li>Exportação de contagem disponível por CSV.</li>
-            <li>Botão de limpar upload reseta o estado da tela.</li>
+            <li>Após finalizar, o sistema exibe os próximos passos.</li>
+            <li>SEGAS pode solicitar recontagem para IC.</li>
+            <li>Fluxos com saldo liberam a ida para recontagem.</li>
           </ul>
         </aside>
       </div>
     </main>
   );
 }
+
