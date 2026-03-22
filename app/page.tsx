@@ -8,12 +8,17 @@ import {
   CheckCircle2,
   ClipboardCheck,
   Clock3,
+  Download,
   LayoutDashboard,
   ScanLine,
   Settings,
   ShieldCheck,
   Upload,
   Warehouse,
+  Users,
+  RefreshCcw,
+  FileCheck,
+  Trash2,
 } from "lucide-react";
 import {
   Bar,
@@ -40,6 +45,8 @@ type CountMode = "open" | "blind";
 type InputSource = "scanner" | "manual";
 type DeviceType = "desktop" | "coletor";
 type QuickAction = "normal" | "saldo-outra" | "fisico-outra";
+type UserRole = "operator" | "ic" | "manager" | "admin";
+type GLCountMode = "mop" | "linha";
 
 type InventoryRow = {
   id: string;
@@ -77,6 +84,8 @@ type CountEntry = {
   recountRequired: boolean;
   officialCount: boolean;
   reconciliationId?: string;
+  glMode?: GLCountMode;
+  recountRequestedToIC?: boolean;
 };
 
 type LocationTask = {
@@ -87,6 +96,35 @@ type LocationTask = {
   status: "Pendente" | "Em andamento" | "Concluída";
   activeCounters: number;
   commodityMix: string[];
+};
+
+type RecountApproval = {
+  id: string;
+  location: string;
+  pn: string;
+  firstCounterBadge: string;
+  recountBadge?: string;
+  expectedQty: number;
+  countedQty: number;
+  comments?: string;
+  status: "pending" | "approved" | "rejected";
+  requestedBy: string;
+};
+
+type HrmCageRow = {
+  pn: string;
+  gaveta: string;
+  quantidade: number;
+};
+
+type HrmCageCompareResult = {
+  key: string;
+  pn: string;
+  gaveta: string;
+  counted: number;
+  saldoDac: number;
+  difference: number;
+  status: "ok" | "divergent";
 };
 
 const PIE_COLORS = ["#0f172a", "#2563eb", "#059669", "#d97706", "#dc2626", "#7c3aed"];
@@ -171,6 +209,45 @@ const SAMPLE_INVENTORY: InventoryRow[] = [
     commodity: "Outros",
     countable: true,
   },
+  {
+    id: "7",
+    PN: "GL1001",
+    Desc: "ITEM GL",
+    Desc2: "ITEM GL",
+    site: "BRH",
+    warehouse: "DOI",
+    location: "GL-01",
+    qty: 42,
+    bulkExpensed: "No",
+    commodity: "Outros",
+    countable: true,
+  },
+  {
+    id: "8",
+    PN: "CAGE001",
+    Desc: "ITEM HRM CAGE",
+    Desc2: "ITEM HRM CAGE",
+    site: "BRH",
+    warehouse: "DOI",
+    location: "HRM CAGE",
+    qty: 60,
+    bulkExpensed: "No",
+    commodity: "Outros",
+    countable: true,
+  },
+  {
+    id: "9",
+    PN: "SEG001",
+    Desc: "ITEM SEGAS",
+    Desc2: "ITEM SEGAS",
+    site: "BRH",
+    warehouse: "DOI",
+    location: "SEGAS-01",
+    qty: 25,
+    bulkExpensed: "No",
+    commodity: "Outros",
+    countable: true,
+  },
 ];
 
 const SAMPLE_ENTRIES: CountEntry[] = [
@@ -209,6 +286,21 @@ const SAMPLE_ENTRIES: CountEntry[] = [
     divergence: "Nenhuma",
     recountRequired: false,
     officialCount: false,
+  },
+];
+
+const SAMPLE_APPROVALS: RecountApproval[] = [
+  {
+    id: "ra1",
+    location: "SEGAS-01",
+    pn: "SEG001",
+    firstCounterBadge: "BDG-1001",
+    recountBadge: "BDG-2002",
+    expectedQty: 25,
+    countedQty: 22,
+    comments: "Solicitação mockada para IC",
+    status: "pending",
+    requestedBy: "Operador 01",
   },
 ];
 
@@ -287,6 +379,156 @@ function getPnProgressColor(
   return "yellow";
 }
 
+function normalizeHeader(value: string) {
+  return value
+    .toString()
+    .trim()
+    .toUpperCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, "_");
+}
+
+function extractRowsFromSheet(json: Record<string, unknown>[]): HrmCageRow[] {
+  return json
+    .map((row) => {
+      const normalized = Object.fromEntries(
+        Object.entries(row).map(([key, value]) => [normalizeHeader(key), value]),
+      );
+
+      const pn = String(
+        normalized.PN ??
+          normalized.PART_NUMBER ??
+          normalized.ITEM ??
+          normalized.SKU ??
+          "",
+      ).trim();
+
+      const gaveta = String(
+        normalized.GAVETA ??
+          normalized.LOCACAO ??
+          normalized.LOCATION ??
+          normalized.BIN ??
+          "",
+      ).trim();
+
+      const quantidade = Number(
+        normalized.QUANTIDADE ??
+          normalized.QTY ??
+          normalized.QUANTITY ??
+          normalized.SALDO ??
+          0,
+      );
+
+      return { pn, gaveta, quantidade };
+    })
+    .filter((row) => row.pn && row.gaveta);
+}
+
+async function parseExcelFile(file: File): Promise<HrmCageRow[]> {
+  const buffer = await file.arrayBuffer();
+  const workbook = XLSX.read(buffer, { type: "array" });
+  const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+  const json = XLSX.utils.sheet_to_json<Record<string, unknown>>(firstSheet, { defval: "" });
+  return extractRowsFromSheet(json);
+}
+
+function compareHrmCageData(
+  countedRows: HrmCageRow[],
+  saldoRows: HrmCageRow[],
+): HrmCageCompareResult[] {
+  const countedMap = new Map<string, number>();
+  const saldoMap = new Map<string, number>();
+  const keys = new Set<string>();
+
+  countedRows.forEach((row) => {
+    const key = `${row.pn}__${row.gaveta}`;
+    countedMap.set(key, (countedMap.get(key) ?? 0) + Number(row.quantidade || 0));
+    keys.add(key);
+  });
+
+  saldoRows.forEach((row) => {
+    const key = `${row.pn}__${row.gaveta}`;
+    saldoMap.set(key, (saldoMap.get(key) ?? 0) + Number(row.quantidade || 0));
+    keys.add(key);
+  });
+
+  return Array.from(keys).map((key) => {
+    const [pn, gaveta] = key.split("__");
+    const counted = countedMap.get(key) ?? 0;
+    const saldoDac = saldoMap.get(key) ?? 0;
+    const difference = counted - saldoDac;
+
+    return {
+      key,
+      pn,
+      gaveta,
+      counted,
+      saldoDac,
+      difference,
+      status: difference === 0 ? "ok" : "divergent",
+    };
+  });
+}
+
+function exportCountsToCsv(entries: CountEntry[]) {
+  const headers = [
+    "location",
+    "pn",
+    "countedQty",
+    "systemQty",
+    "user",
+    "badgeId",
+    "divergence",
+    "notes",
+    "glMode",
+    "recountRequired",
+    "requestedToIC",
+    "endedAt",
+  ];
+
+  const rows = entries.map((entry) =>
+    [
+      entry.location,
+      entry.pn,
+      entry.countedQty,
+      entry.systemQty ?? "",
+      entry.user,
+      entry.badgeId,
+      entry.divergence,
+      entry.notes ?? "",
+      entry.glMode ?? "",
+      entry.recountRequired ? "yes" : "no",
+      entry.recountRequestedToIC ? "yes" : "no",
+      entry.endedAt,
+    ]
+      .map((value) => `"${String(value).replace(/"/g, '""')}"`)
+      .join(","),
+  );
+
+  const csv = [headers.join(","), ...rows].join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.setAttribute("download", "cycle-count-export.csv");
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
+function isGlLocation(location: string) {
+  return location.trim().toUpperCase().startsWith("GL");
+}
+
+function isHrmCage(location: string) {
+  return location.trim().toUpperCase() === "HRM CAGE";
+}
+
+function isSegas(location: string) {
+  return location.trim().toUpperCase().includes("SEGAS");
+}
+
 function LabelText({ text }: { text: string }) {
   return <label className="small muted">{text}</label>;
 }
@@ -327,6 +569,9 @@ export default function Page() {
   const [page, setPage] = useState("dashboard");
   const [inventory, setInventory] = useState<InventoryRow[]>(SAMPLE_INVENTORY);
   const [entries, setEntries] = useState<CountEntry[]>(SAMPLE_ENTRIES);
+  const [approvals, setApprovals] = useState<RecountApproval[]>(SAMPLE_APPROVALS);
+
+  const [role, setRole] = useState<UserRole>("operator");
   const [excludedPNsText, setExcludedPNsText] = useState("VXH4V");
   const [officialCount, setOfficialCount] = useState(true);
   const [search, setSearch] = useState("");
@@ -334,6 +579,7 @@ export default function Page() {
   const [currentLocation, setCurrentLocation] = useState("LINE-01");
   const [selectedLocations, setSelectedLocations] = useState<string[]>(["LINE-01"]);
   const [countMode, setCountMode] = useState<CountMode>("blind");
+  const [glMode, setGlMode] = useState<GLCountMode>("mop");
   const [inputSource, setInputSource] = useState<InputSource>("scanner");
   const [device, setDevice] = useState<DeviceType>("desktop");
   const [user, setUser] = useState("Operador 01");
@@ -350,6 +596,17 @@ export default function Page() {
   const [locationSelectionCount, setLocationSelectionCount] = useState("1");
   const [operatorFilter, setOperatorFilter] = useState("");
 
+  const [countSaved, setCountSaved] = useState(false);
+  const [inventoryFile, setInventoryFile] = useState<File | null>(null);
+  const [saldoDacFile, setSaldoDacFile] = useState<File | null>(null);
+  const [manualRows, setManualRows] = useState<HrmCageRow[]>([{ pn: "", gaveta: "", quantidade: 0 }]);
+  const [compareResults, setCompareResults] = useState<HrmCageCompareResult[]>([]);
+  const [processingHrm, setProcessingHrm] = useState(false);
+
+  const [recountComment, setRecountComment] = useState("");
+  const [recountBadge, setRecountBadge] = useState("");
+  const [selectedRecountId, setSelectedRecountId] = useState("");
+
   const locations = useMemo(() => groupLocations(inventory, entries), [inventory, entries]);
   const availableLocations = useMemo(() => locations.map((l) => l.location), [locations]);
   const selectedLocationLimit = Math.max(1, safeNumber(locationSelectionCount || 1));
@@ -362,6 +619,15 @@ export default function Page() {
     () => quickCountPNs.split(/\n|,|;/).map((x) => x.trim()).filter(Boolean),
     [quickCountPNs]
   );
+
+  const currentIsGL = useMemo(() => isGlLocation(currentLocation), [currentLocation]);
+  const currentIsHRM = useMemo(() => isHrmCage(currentLocation), [currentLocation]);
+  const currentIsSEGAS = useMemo(() => isSegas(currentLocation), [currentLocation]);
+
+  const canSeeOperators = role === "manager" || role === "ic" || role === "admin";
+  const canSeeIcPage = role === "ic" || role === "admin";
+  const canSeeSettings = role === "admin";
+  const canSeeManagerActions = role === "manager" || role === "admin" || role === "ic";
 
   function getPnCountedTotal(location: string, pn: string): number {
     return entries
@@ -510,6 +776,11 @@ export default function Page() {
     });
   }, [locations, search, queueStatus]);
 
+  const selectedRecount = useMemo(
+    () => entries.find((e) => e.id === selectedRecountId) || entries.find((e) => e.recountRequired),
+    [entries, selectedRecountId]
+  );
+
   function handleExcel(file: File) {
     const reader = new FileReader();
 
@@ -583,6 +854,17 @@ export default function Page() {
     reader.readAsArrayBuffer(file);
   }
 
+  function clearUploadState() {
+    setInventory(SAMPLE_INVENTORY);
+    setSelectedLocations(["LINE-01"]);
+    setCurrentLocation("LINE-01");
+    setInventoryFile(null);
+    setSaldoDacFile(null);
+    setManualRows([{ pn: "", gaveta: "", quantidade: 0 }]);
+    setCompareResults([]);
+    setMessage("Base e uploads limpos.");
+  }
+
   function resetForm() {
     setFormPN("");
     setFormQty("");
@@ -590,6 +872,8 @@ export default function Page() {
     setFormNotes("");
     setFormDivergence("Nenhuma");
     setRelatedLocation("");
+    setCountSaved(false);
+    setGlMode("mop");
   }
 
   function toggleLocationSelection(location: string) {
@@ -618,6 +902,8 @@ export default function Page() {
     relatedLocation?: string;
     divergence: DivergenceType;
     notes?: string;
+    glMode?: GLCountMode;
+    recountRequestedToIC?: boolean;
   }): CountEntry {
     const matchedItem = inventory.find(
       (item) => item.countable && item.location === params.location && item.PN.toLowerCase() === params.pn.toLowerCase()
@@ -643,7 +929,30 @@ export default function Page() {
       recountRequired: params.divergence !== "Nenhuma",
       officialCount,
       approvedBy: params.divergence !== "Nenhuma" ? undefined : officialCount ? "Time IC" : "Materiais",
+      glMode: params.glMode,
+      recountRequestedToIC: params.recountRequestedToIC,
     };
+  }
+
+  async function handleCompareHrmCage() {
+    if (!inventoryFile || !saldoDacFile) {
+      setMessage("Anexe o arquivo principal e o arquivo Saldo DAC.");
+      return;
+    }
+
+    try {
+      setProcessingHrm(true);
+      const mainRows = await parseExcelFile(inventoryFile);
+      const saldoRows = await parseExcelFile(saldoDacFile);
+      const mergedRows = [...mainRows, ...manualRows.filter((row) => row.pn && row.gaveta)];
+      const results = compareHrmCageData(mergedRows, saldoRows);
+      setCompareResults(results);
+      setMessage(`Confronto HRM CAGE executado com ${results.length} linha(s).`);
+    } catch {
+      setMessage("Não foi possível processar os arquivos do HRM CAGE.");
+    } finally {
+      setProcessingHrm(false);
+    }
   }
 
   function submitCount() {
@@ -660,6 +969,10 @@ export default function Page() {
       return setMessage("PN não pertence à locação selecionada.");
     }
 
+    if (currentIsHRM && compareResults.length === 0) {
+      return setMessage("Para HRM CAGE, execute primeiro o confronto com o Saldo DAC.");
+    }
+
     const countedQty = safeNumber(formQty);
     const divergence: DivergenceType = !matchedItem
       ? formDivergence === "Nenhuma"
@@ -671,6 +984,8 @@ export default function Page() {
       ? "Erro de contagem"
       : formDivergence;
 
+    const requestIc = currentIsSEGAS && divergence !== "Nenhuma";
+
     const newEntry = createEntry({
       location: activeTask.location,
       pn: formPN.trim(),
@@ -680,22 +995,100 @@ export default function Page() {
       relatedLocation: relatedLocation || undefined,
       divergence,
       notes: formNotes || undefined,
+      glMode: currentIsGL ? glMode : undefined,
+      recountRequestedToIC: requestIc,
     });
 
     setEntries((prev) => [newEntry, ...prev]);
+
+    if (requestIc) {
+      setApprovals((prev) => [
+        {
+          id: generateId(),
+          location: newEntry.location,
+          pn: newEntry.pn,
+          firstCounterBadge: newEntry.badgeId,
+          expectedQty: newEntry.systemQty ?? 0,
+          countedQty: newEntry.countedQty,
+          comments: newEntry.notes,
+          status: "pending",
+          requestedBy: newEntry.user,
+        },
+        ...prev,
+      ]);
+    }
+
+    setCountSaved(true);
     setMessage(`Contagem registrada para ${newEntry.pn} em ${newEntry.location}.`);
-    resetForm();
+    setFormPN("");
+    setFormQty("");
+    setFormPkgId("");
+    setFormDivergence("Nenhuma");
+    setRelatedLocation("");
+  }
+
+  function submitRecount() {
+    if (!selectedRecount) {
+      setMessage("Nenhum item de recontagem selecionado.");
+      return;
+    }
+
+    if (!recountBadge.trim()) {
+      setMessage("Informe o badge do recontador.");
+      return;
+    }
+
+    setApprovals((prev) => {
+      const alreadyExists = prev.some((item) => item.location === selectedRecount.location && item.pn === selectedRecount.pn);
+      if (alreadyExists) return prev;
+
+      return [
+        {
+          id: generateId(),
+          location: selectedRecount.location,
+          pn: selectedRecount.pn,
+          firstCounterBadge: selectedRecount.badgeId,
+          recountBadge,
+          expectedQty: selectedRecount.systemQty ?? 0,
+          countedQty: selectedRecount.countedQty,
+          comments: recountComment,
+          status: "pending",
+          requestedBy: user,
+        },
+        ...prev,
+      ];
+    });
+
+    setMessage(`Recontagem registrada para ${selectedRecount.pn}.`);
+    setRecountComment("");
+    setRecountBadge("");
+  }
+
+  function updateApprovalStatus(id: string, status: "approved" | "rejected") {
+    setApprovals((prev) =>
+      prev.map((item) => (item.id === id ? { ...item, status } : item))
+    );
+    setMessage(`Solicitação ${status === "approved" ? "aprovada" : "rejeitada"} pelo time IC.`);
   }
 
   const nav = [
-    { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
-    { key: "operators", label: "Operadores", icon: Activity },
-    { key: "upload", label: "Upload Excel", icon: Upload },
-    { key: "queue", label: "Fila de contagem", icon: Warehouse },
-    { key: "count", label: "Contagem", icon: ScanLine },
-    { key: "recount", label: "Recontagem", icon: ShieldCheck },
-    { key: "settings", label: "Administração", icon: Settings },
+    { key: "dashboard", label: "Dashboard", icon: LayoutDashboard, visible: true },
+    { key: "operators", label: "Operadores", icon: Users, visible: canSeeOperators },
+    { key: "upload", label: "Upload Excel", icon: Upload, visible: true },
+    { key: "queue", label: "Fila de contagem", icon: Warehouse, visible: true },
+    { key: "count", label: "Contagem", icon: ScanLine, visible: true },
+    { key: "recount", label: "Recontagem", icon: RefreshCcw, visible: true },
+    { key: "ic", label: "IC / Aprovações", icon: FileCheck, visible: canSeeIcPage },
+    { key: "settings", label: "Administração", icon: Settings, visible: canSeeSettings },
   ];
+
+  const visibleNav = nav.filter((item) => item.visible);
+
+  React.useEffect(() => {
+    if (!visibleNav.some((item) => item.key === page)) {
+      setPage("dashboard");
+    }
+  }, [page, visibleNav]);
 
   return (
     <div className="app-shell">
@@ -730,8 +1123,23 @@ export default function Page() {
           </div>
         </div>
 
+        <div className="card section-gap">
+          <div className="card-body">
+            <LabelText text="Perfil mockado" />
+            <select className="select" value={role} onChange={(e) => setRole(e.target.value as UserRole)}>
+              <option value="operator">Operator</option>
+              <option value="ic">IC / Cycle Count</option>
+              <option value="manager">Manager</option>
+              <option value="admin">Admin</option>
+            </select>
+            <div className="small muted" style={{ marginTop: 8 }}>
+              A visão de Operadores fica apenas para manager, IC e admin.
+            </div>
+          </div>
+        </div>
+
         <div className="section-gap">
-          {nav.map((item) => {
+          {visibleNav.map((item) => {
             const Icon = item.icon;
             return (
               <button
@@ -774,9 +1182,32 @@ export default function Page() {
           <div className="topbar-badges">
             <span className="badge">Usuário: {user}</span>
             <span className="badge">Badge: {badgeId || "não informado"}</span>
+            <span className="badge">Perfil: {role}</span>
             <span className="badge">Dispositivo: {device}</span>
             <span className="badge dark">Locação ativa: {activeTask?.location || "-"}</span>
           </div>
+        </div>
+
+        <div className="btn-row section-gap">
+          <button className="btn" onClick={() => exportCountsToCsv(entries)}>
+            <Download size={16} /> Exportar Excel
+          </button>
+          <button className="btn" onClick={clearUploadState}>
+            <Trash2 size={16} /> Limpar upload
+          </button>
+          {canSeeIcPage && (
+            <button className="btn" onClick={() => setPage("ic")}>
+              <ShieldCheck size={16} /> Abrir IC
+            </button>
+          )}
+          {canSeeOperators && (
+            <button className="btn" onClick={() => setPage("operators")}>
+              <Users size={16} /> Abrir gerente / performance
+            </button>
+          )}
+          <button className="btn dark" onClick={() => setPage("recount")}>
+            <RefreshCcw size={16} /> Abrir recontagem
+          </button>
         </div>
 
         {message && (
@@ -844,7 +1275,7 @@ export default function Page() {
           </div>
         )}
 
-        {page === "operators" && (
+        {page === "operators" && canSeeOperators && (
           <div className="section-gap">
             <div className="grid-2">
               <div className="card">
@@ -1164,6 +1595,18 @@ export default function Page() {
                   </div>
                 </div>
 
+                {currentIsGL && (
+                  <div className="card section-gap">
+                    <div className="card-body">
+                      <LabelText text="Regra GL" />
+                      <select className="select" value={glMode} onChange={(e) => setGlMode(e.target.value as GLCountMode)}>
+                        <option value="mop">Contagem MOP</option>
+                        <option value="linha">Contagem linha</option>
+                      </select>
+                    </div>
+                  </div>
+                )}
+
                 <div className="card section-gap">
                   <div className="card-body">
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
@@ -1229,15 +1672,166 @@ export default function Page() {
                         <input className="input" value={relatedLocation} onChange={(e) => setRelatedLocation(e.target.value)} />
                       </div>
                       <div className="field">
-                        <LabelText text="Observação" />
+                        <LabelText text="Comentários" />
                         <textarea className="textarea" value={formNotes} onChange={(e) => setFormNotes(e.target.value)} />
                       </div>
                     </div>
 
+                    {currentIsHRM && (
+                      <div className="card section-gap">
+                        <div className="card-header">
+                          <h3 style={{ margin: 0 }}>HRM CAGE — Saldo DAC</h3>
+                          <div className="muted small">Confronto por PN + gaveta + quantidade.</div>
+                        </div>
+                        <div className="card-body">
+                          <div className="field-grid">
+                            <div className="field">
+                              <LabelText text="Arquivo principal" />
+                              <input
+                                className="file"
+                                type="file"
+                                accept=".xlsx,.xls,.csv"
+                                onChange={(e) => setInventoryFile(e.target.files?.[0] || null)}
+                              />
+                            </div>
+                            <div className="field">
+                              <LabelText text="Arquivo Saldo DAC" />
+                              <input
+                                className="file"
+                                type="file"
+                                accept=".xlsx,.xls,.csv"
+                                onChange={(e) => setSaldoDacFile(e.target.files?.[0] || null)}
+                              />
+                            </div>
+                          </div>
+
+                          <div className="section-gap">
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                              <strong>Gavetas manuais</strong>
+                              <button
+                                type="button"
+                                className="btn"
+                                onClick={() => setManualRows((prev) => [...prev, { pn: "", gaveta: "", quantidade: 0 }])}
+                              >
+                                Adicionar gaveta
+                              </button>
+                            </div>
+
+                            {manualRows.map((row, index) => (
+                              <div key={index} className="field-grid section-gap">
+                                <div className="field">
+                                  <LabelText text="PN" />
+                                  <input
+                                    className="input"
+                                    value={row.pn}
+                                    onChange={(e) => {
+                                      const next = [...manualRows];
+                                      next[index].pn = e.target.value;
+                                      setManualRows(next);
+                                    }}
+                                  />
+                                </div>
+                                <div className="field">
+                                  <LabelText text="Gaveta" />
+                                  <input
+                                    className="input"
+                                    value={row.gaveta}
+                                    onChange={(e) => {
+                                      const next = [...manualRows];
+                                      next[index].gaveta = e.target.value;
+                                      setManualRows(next);
+                                    }}
+                                  />
+                                </div>
+                                <div className="field">
+                                  <LabelText text="Quantidade" />
+                                  <input
+                                    className="input"
+                                    type="number"
+                                    value={row.quantidade}
+                                    onChange={(e) => {
+                                      const next = [...manualRows];
+                                      next[index].quantidade = Number(e.target.value);
+                                      setManualRows(next);
+                                    }}
+                                  />
+                                </div>
+                              </div>
+                            ))}
+
+                            <button className="btn dark" onClick={handleCompareHrmCage} disabled={processingHrm}>
+                              {processingHrm ? "Processando..." : "Confrontar arquivos"}
+                            </button>
+
+                            {compareResults.length > 0 && (
+                              <div className="table-wrap medium section-gap">
+                                <table className="table">
+                                  <thead>
+                                    <tr>
+                                      <th>PN</th>
+                                      <th>Gaveta</th>
+                                      <th>Contado</th>
+                                      <th>Saldo DAC</th>
+                                      <th>Diferença</th>
+                                      <th>Status</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {compareResults.map((row) => (
+                                      <tr key={row.key}>
+                                        <td>{row.pn}</td>
+                                        <td>{row.gaveta}</td>
+                                        <td>{row.counted}</td>
+                                        <td>{row.saldoDac}</td>
+                                        <td>{row.difference}</td>
+                                        <td>
+                                          <span className={row.status === "ok" ? "badge success" : "badge danger"}>
+                                            {row.status}
+                                          </span>
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
                     <div className="btn-row section-gap">
-                      <button className="btn dark" onClick={submitCount}>Registrar contagem</button>
+                      <button className="btn dark" onClick={submitCount}>Finalizar contagem</button>
                       <button className="btn" onClick={resetForm}>Limpar</button>
                     </div>
+
+                    {countSaved && (
+                      <div className="card section-gap">
+                        <div className="card-header">
+                          <h3 style={{ margin: 0 }}>Próximos passos</h3>
+                          <div className="muted small">Ações automáticas conforme a regra operacional.</div>
+                        </div>
+                        <div className="card-body">
+                          <div className="btn-row">
+                            {(countMode === "open" || currentIsHRM || compareResults.length > 0) && (
+                              <button className="btn dark" onClick={() => setPage("recount")}>
+                                Ir para recontagem
+                              </button>
+                            )}
+
+                            {currentIsSEGAS && formDivergence !== "Nenhuma" && (
+                              <button className="btn" onClick={() => setPage(canSeeIcPage ? "ic" : "recount")}>
+                                Solicitar recontagem para IC
+                              </button>
+                            )}
+
+                            <button className="btn" onClick={() => exportCountsToCsv(entries)}>
+                              Exportar contagem para Excel
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
@@ -1364,6 +1958,7 @@ export default function Page() {
                           <th>Badge</th>
                           <th>Operador</th>
                           <th>Divergência</th>
+                          <th>Comentário</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -1377,6 +1972,7 @@ export default function Page() {
                               <td>{entry.badgeId}</td>
                               <td>{entry.user}</td>
                               <td>{entry.divergence}</td>
+                              <td>{entry.notes || "-"}</td>
                             </tr>
                           ))}
                       </tbody>
@@ -1389,31 +1985,126 @@ export default function Page() {
         )}
 
         {page === "recount" && (
+          <div className="grid-2 section-gap">
+            <div className="card">
+              <div className="card-header">
+                <h3 style={{ margin: 0 }}>Fila de recontagem</h3>
+                <div className="muted small">Divergências pendentes de aprovação oficial ou interna.</div>
+              </div>
+              <div className="card-body">
+                <div className="table-wrap medium">
+                  <table className="table">
+                    <thead>
+                      <tr>
+                        <th>Locação</th>
+                        <th>PN</th>
+                        <th>Tipo</th>
+                        <th>Responsável</th>
+                        <th>Badge</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {entries.filter((e) => e.recountRequired).map((entry) => (
+                        <tr
+                          key={entry.id}
+                          style={{ cursor: "pointer" }}
+                          onClick={() => setSelectedRecountId(entry.id)}
+                        >
+                          <td>{entry.location}</td>
+                          <td>{entry.pn}</td>
+                          <td>{entry.divergence}</td>
+                          <td>{entry.user}</td>
+                          <td>{entry.badgeId}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+            <div className="card">
+              <div className="card-header">
+                <h3 style={{ margin: 0 }}>Registrar recontagem</h3>
+                <div className="muted small">Comentário e badge dos contadores.</div>
+              </div>
+              <div className="card-body">
+                <div className="field-grid">
+                  <div className="field">
+                    <LabelText text="Badge do primeiro contador" />
+                    <input className="input" value={selectedRecount?.badgeId || ""} readOnly />
+                  </div>
+                  <div className="field">
+                    <LabelText text="Badge da recontagem" />
+                    <input className="input" value={recountBadge} onChange={(e) => setRecountBadge(e.target.value)} />
+                  </div>
+                  <div className="field">
+                    <LabelText text="Comentário da recontagem" />
+                    <textarea className="textarea" value={recountComment} onChange={(e) => setRecountComment(e.target.value)} />
+                  </div>
+                </div>
+
+                <div className="btn-row section-gap">
+                  <button className="btn dark" onClick={submitRecount}>Salvar recontagem</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {page === "ic" && canSeeIcPage && (
           <div className="card section-gap">
             <div className="card-header">
-              <h3 style={{ margin: 0 }}>Fila de recontagem</h3>
-              <div className="muted small">Divergências pendentes de aprovação oficial ou interna.</div>
+              <h3 style={{ margin: 0 }}>Aprovação de recontagem — Time IC</h3>
+              <div className="muted small">Tela restrita ao cycle count e administração.</div>
             </div>
             <div className="card-body">
-              <div className="table-wrap medium">
+              <div className="table-wrap tall">
                 <table className="table">
                   <thead>
                     <tr>
                       <th>Locação</th>
                       <th>PN</th>
-                      <th>Tipo</th>
-                      <th>Responsável</th>
-                      <th>Badge</th>
+                      <th>1º contador</th>
+                      <th>Recontador</th>
+                      <th>Esperado</th>
+                      <th>Contado</th>
+                      <th>Comentário</th>
+                      <th>Status</th>
+                      <th>Ações</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {entries.filter((e) => e.recountRequired).map((entry) => (
-                      <tr key={entry.id}>
-                        <td>{entry.location}</td>
-                        <td>{entry.pn}</td>
-                        <td>{entry.divergence}</td>
-                        <td>{entry.user}</td>
-                        <td>{entry.badgeId}</td>
+                    {approvals.map((item) => (
+                      <tr key={item.id}>
+                        <td>{item.location}</td>
+                        <td>{item.pn}</td>
+                        <td>{item.firstCounterBadge}</td>
+                        <td>{item.recountBadge || "-"}</td>
+                        <td>{item.expectedQty}</td>
+                        <td>{item.countedQty}</td>
+                        <td>{item.comments || "-"}</td>
+                        <td>
+                          <span className={
+                            item.status === "approved"
+                              ? "badge success"
+                              : item.status === "rejected"
+                              ? "badge danger"
+                              : "badge warn"
+                          }>
+                            {item.status}
+                          </span>
+                        </td>
+                        <td>
+                          <div className="btn-row">
+                            <button className="btn" onClick={() => updateApprovalStatus(item.id, "approved")}>
+                              Aprovar
+                            </button>
+                            <button className="btn" onClick={() => updateApprovalStatus(item.id, "rejected")}>
+                              Rejeitar
+                            </button>
+                          </div>
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -1423,7 +2114,7 @@ export default function Page() {
           </div>
         )}
 
-        {page === "settings" && (
+        {page === "settings" && canSeeSettings && (
           <div className="grid-2 section-gap">
             <div className="card">
               <div className="card-header">
@@ -1448,10 +2139,13 @@ export default function Page() {
                 <div className="small muted">
                   • Badge obrigatório para iniciar e registrar<br />
                   • Rastreabilidade por operador e por badge<br />
-                  • Múltiplos operadores no mesmo PN/location com histórico individual<br />
                   • Top 5 por quarter e anual<br />
                   • Filtro por operador/badge<br />
-                  • Blindagem contra dados inválidos
+                  • Operadores visível só para manager, IC e admin<br />
+                  • Aprovação de recontagem no painel IC<br />
+                  • Regra GL com MOP / linha<br />
+                  • Regra HRM CAGE com Saldo DAC e gavetas<br />
+                  • Exportação CSV e limpeza de upload
                 </div>
               </div>
             </div>
