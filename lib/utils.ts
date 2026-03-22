@@ -9,3 +9,4 @@ export const mockUploads: InventoryUpload[] = [
     upload_type: "inventory",
   },
 ];
+export {};
