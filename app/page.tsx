@@ -44,8 +44,7 @@ type DivergenceType =
 type CountMode = "open" | "blind";
 type InputSource = "scanner" | "manual";
 type DeviceType = "desktop" | "coletor";
-type QuickAction = "normal" | "saldo-outra" | "fisico-outra";
-type UserRole = "operator" | "ic" | "manager" | "admin";
+type UserRole = "operator" | "cycle_count" | "ic" | "manager" | "admin";
 type GLCountMode = "mop" | "linha";
 
 type InventoryRow = {
@@ -109,6 +108,7 @@ type RecountApproval = {
   comments?: string;
   status: "pending" | "approved" | "rejected";
   requestedBy: string;
+  sourceMode: CountMode;
 };
 
 type HrmCageRow = {
@@ -276,15 +276,15 @@ const SAMPLE_ENTRIES: CountEntry[] = [
     pn: "MAT003",
     countedQty: 55,
     systemQty: 55,
-    mode: "open",
+    mode: "blind",
     inputSource: "manual",
     user: "Bruno",
     badgeId: "BDG-2002",
     device: "desktop",
     startedAt: "2026-03-16T09:00:00",
     endedAt: "2026-03-16T09:05:00",
-    divergence: "Nenhuma",
-    recountRequired: false,
+    divergence: "Erro de contagem",
+    recountRequired: true,
     officialCount: false,
   },
 ];
@@ -298,9 +298,10 @@ const SAMPLE_APPROVALS: RecountApproval[] = [
     recountBadge: "BDG-2002",
     expectedQty: 25,
     countedQty: 22,
-    comments: "Solicitação mockada para IC",
+    comments: "Solicitação mockada",
     status: "pending",
     requestedBy: "Operador 01",
+    sourceMode: "blind",
   },
 ];
 
@@ -484,6 +485,7 @@ function exportCountsToCsv(entries: CountEntry[]) {
     "glMode",
     "recountRequired",
     "requestedToIC",
+    "countMode",
     "endedAt",
   ];
 
@@ -500,6 +502,7 @@ function exportCountsToCsv(entries: CountEntry[]) {
       entry.glMode ?? "",
       entry.recountRequired ? "yes" : "no",
       entry.recountRequestedToIC ? "yes" : "no",
+      entry.mode,
       entry.endedAt,
     ]
       .map((value) => `"${String(value).replace(/"/g, '""')}"`)
@@ -527,6 +530,20 @@ function isHrmCage(location: string) {
 
 function isSegas(location: string) {
   return location.trim().toUpperCase().includes("SEGAS");
+}
+
+function canSeePerformance(role: UserRole) {
+  return role === "cycle_count" || role === "manager" || role === "admin";
+}
+
+function canSeeIc(role: UserRole) {
+  return role === "cycle_count" || role === "ic" || role === "manager" || role === "admin";
+}
+
+function canApproveApproval(role: UserRole, sourceMode: CountMode) {
+  if (role === "manager" || role === "admin" || role === "ic") return true;
+  if (role === "cycle_count") return sourceMode === "open";
+  return false;
 }
 
 function LabelText({ text }: { text: string }) {
@@ -624,10 +641,9 @@ export default function Page() {
   const currentIsHRM = useMemo(() => isHrmCage(currentLocation), [currentLocation]);
   const currentIsSEGAS = useMemo(() => isSegas(currentLocation), [currentLocation]);
 
-  const canSeeOperators = role === "manager" || role === "ic" || role === "admin";
-  const canSeeIcPage = role === "ic" || role === "admin";
+  const canViewPerformance = canSeePerformance(role);
+  const canViewIc = canSeeIc(role);
   const canSeeSettings = role === "admin";
-  const canSeeManagerActions = role === "manager" || role === "admin" || role === "ic";
 
   function getPnCountedTotal(location: string, pn: string): number {
     return entries
@@ -1001,7 +1017,7 @@ export default function Page() {
 
     setEntries((prev) => [newEntry, ...prev]);
 
-    if (requestIc) {
+    if (newEntry.recountRequired) {
       setApprovals((prev) => [
         {
           id: generateId(),
@@ -1013,6 +1029,7 @@ export default function Page() {
           comments: newEntry.notes,
           status: "pending",
           requestedBy: newEntry.user,
+          sourceMode: newEntry.mode,
         },
         ...prev,
       ]);
@@ -1040,7 +1057,13 @@ export default function Page() {
 
     setApprovals((prev) => {
       const alreadyExists = prev.some((item) => item.location === selectedRecount.location && item.pn === selectedRecount.pn);
-      if (alreadyExists) return prev;
+      if (alreadyExists) {
+        return prev.map((item) =>
+          item.location === selectedRecount.location && item.pn === selectedRecount.pn
+            ? { ...item, recountBadge, comments: recountComment || item.comments }
+            : item
+        );
+      }
 
       return [
         {
@@ -1054,6 +1077,7 @@ export default function Page() {
           comments: recountComment,
           status: "pending",
           requestedBy: user,
+          sourceMode: selectedRecount.mode,
         },
         ...prev,
       ];
@@ -1065,20 +1089,28 @@ export default function Page() {
   }
 
   function updateApprovalStatus(id: string, status: "approved" | "rejected") {
+    const approval = approvals.find((item) => item.id === id);
+    if (!approval) return;
+
+    if (!canApproveApproval(role, approval.sourceMode)) {
+      setMessage("Seu perfil não pode aprovar este tipo de recontagem.");
+      return;
+    }
+
     setApprovals((prev) =>
       prev.map((item) => (item.id === id ? { ...item, status } : item))
     );
-    setMessage(`Solicitação ${status === "approved" ? "aprovada" : "rejeitada"} pelo time IC.`);
+    setMessage(`Solicitação ${status === "approved" ? "aprovada" : "rejeitada"}.`);
   }
 
   const nav = [
     { key: "dashboard", label: "Dashboard", icon: LayoutDashboard, visible: true },
-    { key: "operators", label: "Operadores", icon: Users, visible: canSeeOperators },
+    { key: "operators", label: "Operadores", icon: Users, visible: canViewPerformance },
     { key: "upload", label: "Upload Excel", icon: Upload, visible: true },
     { key: "queue", label: "Fila de contagem", icon: Warehouse, visible: true },
     { key: "count", label: "Contagem", icon: ScanLine, visible: true },
     { key: "recount", label: "Recontagem", icon: RefreshCcw, visible: true },
-    { key: "ic", label: "IC / Aprovações", icon: FileCheck, visible: canSeeIcPage },
+    { key: "ic", label: "IC / Aprovações", icon: FileCheck, visible: canViewIc },
     { key: "settings", label: "Administração", icon: Settings, visible: canSeeSettings },
   ];
 
@@ -1105,35 +1137,25 @@ export default function Page() {
 
         <div className="card section-gap">
           <div className="card-body">
-            <div className="small muted">Ambiente</div>
-            <div className="section-gap small">
-              <div>
-                Portal <span className="badge" style={{ float: "right" }}>SharePoint</span>
-              </div>
-              <div style={{ marginTop: 8 }}>
-                Aplicação <span className="badge" style={{ float: "right" }}>Vercel</span>
-              </div>
-              <div style={{ marginTop: 8 }}>
-                Usuários <span className="badge" style={{ float: "right" }}>40</span>
-              </div>
-              <div style={{ marginTop: 8 }}>
-                Mesma locação <span className="badge" style={{ float: "right" }}>até 4</span>
-              </div>
+            <LabelText text="Perfil de acesso" />
+            <select className="select" value={role} onChange={(e) => setRole(e.target.value as UserRole)}>
+              <option value="operator">Operador</option>
+              <option value="cycle_count">Cycle Count</option>
+              <option value="ic">IC</option>
+              <option value="manager">Gerente</option>
+              <option value="admin">Admin</option>
+            </select>
+            <div className="small muted" style={{ marginTop: 8 }}>
+              Dashboard liberado para todos.
             </div>
           </div>
         </div>
 
         <div className="card section-gap">
           <div className="card-body">
-            <LabelText text="Perfil mockado" />
-            <select className="select" value={role} onChange={(e) => setRole(e.target.value as UserRole)}>
-              <option value="operator">Operator</option>
-              <option value="ic">IC / Cycle Count</option>
-              <option value="manager">Manager</option>
-              <option value="admin">Admin</option>
-            </select>
+            <LabelText text="Rastreabilidade ativa" />
             <div className="small muted" style={{ marginTop: 8 }}>
-              A visão de Operadores fica apenas para manager, IC e admin.
+              Registro por operador, badge, locação, tipo de contagem, GL e HRM CAGE.
             </div>
           </div>
         </div>
@@ -1164,7 +1186,7 @@ export default function Page() {
               />
             </div>
             <div className="small muted" style={{ marginTop: 8 }}>
-              Oficial aprova com time IC. Interna aprova com materiais.
+              Cycle Count só aprova recontagem com saldo. Recontagem cega segue sem essa aprovação.
             </div>
           </div>
         </div>
@@ -1175,7 +1197,7 @@ export default function Page() {
           <div>
             <h1 style={{ margin: "0 0 6px" }}>{nav.find((n) => n.key === page)?.label}</h1>
             <div className="muted">
-              Operação, acurácia, divergências e performance em um único ambiente.
+              Operação, acurácia, divergências, desempenho e rastreabilidade em um único ambiente.
             </div>
           </div>
 
@@ -1195,14 +1217,14 @@ export default function Page() {
           <button className="btn" onClick={clearUploadState}>
             <Trash2 size={16} /> Limpar upload
           </button>
-          {canSeeIcPage && (
+          {canViewIc && (
             <button className="btn" onClick={() => setPage("ic")}>
               <ShieldCheck size={16} /> Abrir IC
             </button>
           )}
-          {canSeeOperators && (
+          {canViewPerformance && (
             <button className="btn" onClick={() => setPage("operators")}>
-              <Users size={16} /> Abrir gerente / performance
+              <Users size={16} /> Abrir desempenho
             </button>
           )}
           <button className="btn dark" onClick={() => setPage("recount")}>
@@ -1275,7 +1297,7 @@ export default function Page() {
           </div>
         )}
 
-        {page === "operators" && canSeeOperators && (
+        {page === "operators" && canViewPerformance && (
           <div className="section-gap">
             <div className="grid-2">
               <div className="card">
@@ -1819,8 +1841,8 @@ export default function Page() {
                               </button>
                             )}
 
-                            {currentIsSEGAS && formDivergence !== "Nenhuma" && (
-                              <button className="btn" onClick={() => setPage(canSeeIcPage ? "ic" : "recount")}>
+                            {currentIsSEGAS && formDivergence !== "Nenhuma" && canViewIc && (
+                              <button className="btn" onClick={() => setPage("ic")}>
                                 Solicitar recontagem para IC
                               </button>
                             )}
@@ -1959,6 +1981,7 @@ export default function Page() {
                           <th>Operador</th>
                           <th>Divergência</th>
                           <th>Comentário</th>
+                          <th>Modo</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -1973,6 +1996,7 @@ export default function Page() {
                               <td>{entry.user}</td>
                               <td>{entry.divergence}</td>
                               <td>{entry.notes || "-"}</td>
+                              <td>{entry.mode === "open" ? "Com saldo" : "Cega"}</td>
                             </tr>
                           ))}
                       </tbody>
@@ -1989,7 +2013,7 @@ export default function Page() {
             <div className="card">
               <div className="card-header">
                 <h3 style={{ margin: 0 }}>Fila de recontagem</h3>
-                <div className="muted small">Divergências pendentes de aprovação oficial ou interna.</div>
+                <div className="muted small">Divergências pendentes com rastreabilidade por badge.</div>
               </div>
               <div className="card-body">
                 <div className="table-wrap medium">
@@ -2001,6 +2025,7 @@ export default function Page() {
                         <th>Tipo</th>
                         <th>Responsável</th>
                         <th>Badge</th>
+                        <th>Modo</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -2015,6 +2040,7 @@ export default function Page() {
                           <td>{entry.divergence}</td>
                           <td>{entry.user}</td>
                           <td>{entry.badgeId}</td>
+                          <td>{entry.mode === "open" ? "Com saldo" : "Cega"}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -2052,11 +2078,13 @@ export default function Page() {
           </div>
         )}
 
-        {page === "ic" && canSeeIcPage && (
+        {page === "ic" && canViewIc && (
           <div className="card section-gap">
             <div className="card-header">
-              <h3 style={{ margin: 0 }}>Aprovação de recontagem — Time IC</h3>
-              <div className="muted small">Tela restrita ao cycle count e administração.</div>
+              <h3 style={{ margin: 0 }}>Aprovação de recontagem</h3>
+              <div className="muted small">
+                Cycle Count aprova apenas recontagem com saldo. IC, manager e admin aprovam todas.
+              </div>
             </div>
             <div className="card-body">
               <div className="table-wrap tall">
@@ -2070,43 +2098,53 @@ export default function Page() {
                       <th>Esperado</th>
                       <th>Contado</th>
                       <th>Comentário</th>
+                      <th>Modo</th>
                       <th>Status</th>
                       <th>Ações</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {approvals.map((item) => (
-                      <tr key={item.id}>
-                        <td>{item.location}</td>
-                        <td>{item.pn}</td>
-                        <td>{item.firstCounterBadge}</td>
-                        <td>{item.recountBadge || "-"}</td>
-                        <td>{item.expectedQty}</td>
-                        <td>{item.countedQty}</td>
-                        <td>{item.comments || "-"}</td>
-                        <td>
-                          <span className={
-                            item.status === "approved"
-                              ? "badge success"
-                              : item.status === "rejected"
-                              ? "badge danger"
-                              : "badge warn"
-                          }>
-                            {item.status}
-                          </span>
-                        </td>
-                        <td>
-                          <div className="btn-row">
-                            <button className="btn" onClick={() => updateApprovalStatus(item.id, "approved")}>
-                              Aprovar
-                            </button>
-                            <button className="btn" onClick={() => updateApprovalStatus(item.id, "rejected")}>
-                              Rejeitar
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
+                    {approvals.map((item) => {
+                      const canApproveThis = canApproveApproval(role, item.sourceMode);
+
+                      return (
+                        <tr key={item.id}>
+                          <td>{item.location}</td>
+                          <td>{item.pn}</td>
+                          <td>{item.firstCounterBadge}</td>
+                          <td>{item.recountBadge || "-"}</td>
+                          <td>{item.expectedQty}</td>
+                          <td>{item.countedQty}</td>
+                          <td>{item.comments || "-"}</td>
+                          <td>{item.sourceMode === "open" ? "Com saldo" : "Cega"}</td>
+                          <td>
+                            <span className={
+                              item.status === "approved"
+                                ? "badge success"
+                                : item.status === "rejected"
+                                ? "badge danger"
+                                : "badge warn"
+                            }>
+                              {item.status}
+                            </span>
+                          </td>
+                          <td>
+                            {canApproveThis ? (
+                              <div className="btn-row">
+                                <button className="btn" onClick={() => updateApprovalStatus(item.id, "approved")}>
+                                  Aprovar
+                                </button>
+                                <button className="btn" onClick={() => updateApprovalStatus(item.id, "rejected")}>
+                                  Rejeitar
+                                </button>
+                              </div>
+                            ) : (
+                              <span className="badge neutral">Sem permissão</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -2137,12 +2175,12 @@ export default function Page() {
               </div>
               <div className="card-body">
                 <div className="small muted">
-                  • Badge obrigatório para iniciar e registrar<br />
-                  • Rastreabilidade por operador e por badge<br />
-                  • Top 5 por quarter e anual<br />
-                  • Filtro por operador/badge<br />
-                  • Operadores visível só para manager, IC e admin<br />
-                  • Aprovação de recontagem no painel IC<br />
+                  • Dashboard visível para todos<br />
+                  • Desempenho visível para Cycle Count, manager e admin<br />
+                  • IC sem acesso ao desempenho<br />
+                  • Cycle Count aprova só recontagem com saldo<br />
+                  • IC, manager e admin aprovam todas<br />
+                  • Rastreabilidade por badge, operador, locação e modo<br />
                   • Regra GL com MOP / linha<br />
                   • Regra HRM CAGE com Saldo DAC e gavetas<br />
                   • Exportação CSV e limpeza de upload
